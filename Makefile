@@ -27,6 +27,10 @@ fmt:
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
+zip:
+	@echo TODO: Add NESFIT to gitea repo
+	zip -r xhumeno00.zip *.md LICENCE Makefile src test
+
 clean:
 	cargo clean
 	rm -f ./$(BIN)

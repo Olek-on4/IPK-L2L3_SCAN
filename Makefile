@@ -16,7 +16,7 @@ run:
 	cargo run --release --bin $(BIN) --
 
 test:
-	cargo test --all --all-targets
+	bash test/test.sh run
 
 check:
 	cargo check --all-targets

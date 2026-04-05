@@ -1,12 +1,15 @@
 //! L2L3-scanner: Scans for available IPv4 and IPv6 addresses on a specified network interface.
+#![allow(non_snake_case)]
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use pnet::packet::icmp::echo_reply::IcmpCodes;
 use pnet::packet::icmpv6::echo_reply::Icmpv6Codes;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -20,8 +23,8 @@ use pnet::packet::ethernet::{EtherTypes, EtherType, EthernetPacket, MutableEther
 use pnet::packet::icmpv6::{
     echo_reply::EchoReplyPacket as EchoReplyPacketV6,
     echo_request::MutableEchoRequestPacket as MutableEchoRequestPacketV6,
-    ndp::{MutableNeighborSolicitPacket, NeighborAdvertPacket},
-    Icmpv6Code, Icmpv6Packet, Icmpv6Types
+    ndp::{MutableNeighborSolicitPacket, NeighborAdvertPacket, NdpOption, NdpOptionTypes},
+    Icmpv6Packet, Icmpv6Types
 };
 use pnet::packet::ip::{IpNextHeaderProtocols};
 use pnet::packet::ipv6::{Ipv6Packet, MutableIpv6Packet};
@@ -125,8 +128,15 @@ struct Scanner {
     control_rx: Receiver<ControlMessage>,
 }
 
+/// IP address and MAC address pair for discovered hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AddressPair {
+    ip: IpAddr,
+    mac: MacAddr,
+}
+
 /// IP address match pair.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ScanMatch {
     mac_addr: Option<MacAddr>,
     icmp_responded: bool,
@@ -214,16 +224,21 @@ impl Scanner {
             }),
             Err(mpsc::TryRecvError::Empty) => Ok(()),
             Err(mpsc::TryRecvError::Disconnected) => Err(ScannerError {
-                code: ScannerExitCode::Internal,
+                code: ScannerExitCode::Io,
                 message: "Failed to check signal channel state".to_string()
             }),
         }
     }
 
+    /// Check if address belongs to local segment of the interface.
+    fn addr_is_local(&self, addr: IpAddr) -> bool {
+        self.interface.ips.iter().any(|net| net.contains(addr))
+    }
+
     /// Get interface MAC address, or error if not found.
     fn get_iface_mac(interface: &NetworkInterface) -> Result<MacAddr, ScannerError> {
         interface.mac.ok_or_else(|| ScannerError {
-            code: ScannerExitCode::Internal,
+            code: ScannerExitCode::Os,
             message: "Failed to retrieve MAC address for the interface".to_string(),
         })
     }
@@ -348,7 +363,7 @@ impl Scanner {
 
     /// Construct an NDP Neighbor Solicitation packet for the given target IPv6 address.
     fn make_ndp(&self, target_ip: &Ipv6Addr) -> Result<Vec<u8>, ScannerError> {
-        let ndp_len = MutableNeighborSolicitPacket::minimum_packet_size();
+        let ndp_len = MutableNeighborSolicitPacket::minimum_packet_size() + 8; // 8 for Source MAC option
 
         // Solicited-node multicast MAC keeps the request on the target neighborhood.
         // IPv6 EtherType marks the payload as IPv6.
@@ -360,9 +375,10 @@ impl Scanner {
             MutableIpv6Packet::minimum_packet_size() + ndp_len
         )?;
 
-        // Source IPv6 must be a local address on the selected interface.
         let source_ip = Self::get_iface_ipv6(&self.interface)?;
-        // Destination IPv6 is the solicited-node multicast address for the target.
+        // Source MAC option is required
+        let source_mac = Self::get_iface_mac(&self.interface)?;
+        // Destination IPv6 is the solicited-node multicast address
         let dest_ip = Self::new_ns_addr(target_ip);
 
         let mut eth_packet = MutableEthernetPacket::new(&mut buffer).ok_or_else(|| ScannerError {
@@ -394,6 +410,21 @@ impl Scanner {
 
         ndp_packet.set_icmpv6_type(Icmpv6Types::NeighborSolicit);
         ndp_packet.set_target_addr(*target_ip);
+
+        // Add Source Link-Layer Address option
+        let options = [NdpOption {
+            option_type: NdpOptionTypes::SourceLLAddr,
+            length: 1,
+            data: vec![
+                source_mac.0,
+                source_mac.1,
+                source_mac.2,
+                source_mac.3,
+                source_mac.4,
+                source_mac.5,
+            ],
+        }];
+        ndp_packet.set_options(&options);
 
         let icmp_packet = Icmpv6Packet::new(ndp_packet.packet()).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
@@ -431,7 +462,9 @@ impl Scanner {
             message: "Failed to create IPv4 packet for ICMP".to_string(),
         })?;
 
+        // For IPv4
         ipv4_packet.set_version(4);
+        // 5 fields of 4 bytes
         ipv4_packet.set_header_length(5);
         ipv4_packet.set_total_length((MutableIpv4Packet::minimum_packet_size() + echo_len) as u16);
         ipv4_packet.set_ttl(64);
@@ -439,9 +472,12 @@ impl Scanner {
         ipv4_packet.set_source(source_ip);
         ipv4_packet.set_destination(*target_ip);
 
-        // IPv4 header checksum must be calculated and set
-        //ipv4_packet.set_checksum(0);
-        let ipv4_checksum = pnet::packet::ipv4::checksum(&Ipv4Packet::new(ipv4_packet.packet()).unwrap());
+        // IPv4 header checksum must be calculated
+        let ipv4_packet_imm = Ipv4Packet::new(ipv4_packet.packet()).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to view IPv4 packet for checksum calculation".to_string(),
+        })?;
+        let ipv4_checksum = pnet::packet::ipv4::checksum(&ipv4_packet_imm);
         ipv4_packet.set_checksum(ipv4_checksum);
 
         let mut icmp_packet = MutableEchoRequestPacket::new(ipv4_packet.payload_mut()).ok_or_else(|| ScannerError {
@@ -452,9 +488,13 @@ impl Scanner {
         icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
         icmp_packet.set_sequence_number(sequence_number);
         icmp_packet.set_identifier(identifier);
-        // ICMP checksum must be calculated on packet with checksum field zeroed
-        //icmp_packet.set_checksum(0);
-        let checksum_value = icmp::checksum(&IcmpPacket::new(icmp_packet.packet()).unwrap());
+
+
+        let icmp_packet_imm = IcmpPacket::new(icmp_packet.packet()).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to view ICMPv4 echo request for checksum calculation".to_string(),
+        })?;
+        let checksum_value = icmp::checksum(&icmp_packet_imm);
         icmp_packet.set_checksum(checksum_value);
 
         Ok(buffer)
@@ -514,311 +554,354 @@ impl Scanner {
         Ok(buffer)
     }
 
-    /// Perform ARP on IPV4, returns MAC address if found
-    fn l2_scan_ipv4(&self, tx: & mut Box<dyn DataLinkSender>, rx: & mut Box<dyn DataLinkReceiver>, addr: &Ipv4Addr)
-        -> Result<Option<MacAddr>, ScannerError>
-    {
-        let arp_request = self.make_arp(addr)?;
-        // Try sending
-        let send_result = tx.send_to(&arp_request, None).ok_or_else(|| ScannerError {
-            code: ScannerExitCode::Os,
-            message: "Failed to queue ARP frame for sending".to_string(),
-        })?;
-
-        // Check how sending finished
-        if send_result.is_err() {
-            let error_message = format!("Failed to send ARP frame: {}", send_result.as_ref().err().unwrap());
-            return Err(ScannerError {
-                code: ScannerExitCode::Os,
-                message: error_message,
-            });
+    /// Parse ARP reply frame and extract (sender IPv4, sender MAC).
+    fn parse_arp(packet: &[u8], source_ip: Ipv4Addr, source_mac: MacAddr) -> Option<AddressPair> {
+        // Try constructing Ethernet packet, on fail continue
+        let eth_packet = EthernetPacket::new(packet)?;
+        // Check for correct EtherType field
+        if eth_packet.get_ethertype() != EtherTypes::Arp {
+            return None;
         }
 
-        let deadline = Instant::now() + self.timeout;
-        // Await response or end on timeout
-        while Instant::now() < deadline {
-            match rx.next() {
-                Ok(frame) => { // Gradually check for valid format and data
-                    // Try constructing Ethernet packet, on fail continue
-                    let Some(eth_packet) = EthernetPacket::new(frame) else {
-                        continue;
-                    };
-                    // Check for correct EtherType field
-                    if eth_packet.get_ethertype() != EtherTypes::Arp {
-                        continue;
-                    }
-
-                    // Try parsing as ARP packet, on fail continue
-                    let Some(arp_packet) = ArpPacket::new(eth_packet.payload()) else {
-                        continue;
-                    };
-                    // Check for ARP reply operation
-                    if arp_packet.get_operation() != ArpOperations::Reply {
-                        continue;
-                    };
-                    // Check if sender address matches target
-                    if arp_packet.get_sender_proto_addr() == *addr {
-                        return Ok(Some(eth_packet.get_source()));
-                    }
-                }
-                Err(_) => break,
-            }
+        // Try parsing as ARP packet, on fail continue
+        let arp_packet = ArpPacket::new(eth_packet.payload())?;
+        // Check ARP header fields
+        if arp_packet.get_hardware_type() != ArpHardwareTypes::Ethernet {
+            return None;
+        }
+        if arp_packet.get_protocol_type() != EtherTypes::Ipv4 {
+            return None;
+        }
+        if arp_packet.get_hw_addr_len() != 6 || arp_packet.get_proto_addr_len() != 4 {
+            return None;
+        }
+        // Check for ARP reply operation
+        if arp_packet.get_operation() != ArpOperations::Reply {
+            return None;
+        }
+        // Reply must be addressed to us and must advertise its own IPv4.
+        if arp_packet.get_target_proto_addr() != source_ip {
+            return None;
+        }
+        if arp_packet.get_target_hw_addr() != source_mac {
+            return None;
         }
 
-        Ok(None)
+        Some(AddressPair {
+            ip: arp_packet.get_sender_proto_addr().into(),
+            mac: arp_packet.get_sender_hw_addr(),
+        })
     }
 
-    /// Perform NDP on IPv6, returns MAC address if found
-    fn l2_scan_ipv6(&self, tx: & mut Box<dyn DataLinkSender>, rx: & mut Box<dyn DataLinkReceiver>, addr: &Ipv6Addr)
-        -> Result<Option<MacAddr>, ScannerError>
-    {
-        let ndp_request = self.make_ndp(addr)?;
-        let send_result = tx.send_to(&ndp_request, None).ok_or_else(|| ScannerError {
-            code: ScannerExitCode::Os,
-            message: "Failed to queue NDP frame for sending".to_string(),
-        })?;
-
-        // Check how sending finished
-        if send_result.is_err() {
-            let error_message = format!("Failed to send NDP frame: {}", send_result.err().unwrap());
-            return Err(ScannerError {
-                code: ScannerExitCode::Os,
-                message: error_message,
-            });
+    /// Parse Neighbor Advertisement and extract (target IPv6, source MAC).
+    fn parse_na(packet: &[u8], source_ip: Ipv6Addr) -> Option<AddressPair> {
+        // Try constructing Ethernet packet, on fail continue
+        let eth_packet = EthernetPacket::new(packet)?;
+        // Check for correct EtherType field
+        if eth_packet.get_ethertype() != EtherTypes::Ipv6 {
+            return None;
         }
 
-        let deadline = Instant::now() + self.timeout;
-        // Await response or end on timeout
-        while Instant::now() < deadline {
-            match rx.next() {
-                Ok(frame) => { // Gradually check for valid format and data
-                    // Try constructing Ethernet packet, on fail continue
-                    let Some(eth_packet) = EthernetPacket::new(frame) else {
-                        continue;
-                    };
-                    // Check for correct EtherType field
-                    if eth_packet.get_ethertype() != EtherTypes::Ipv6 {
-                        continue;
-                    }
+        // Try parsing as IPv6 packet, on fail continue
+        let ipv6_packet = Ipv6Packet::new(eth_packet.payload())?;
+        // Check the next_header field
+        if ipv6_packet.get_next_header() != IpNextHeaderProtocols::Icmpv6 {
+            return None;
+        }
 
-                    // Try parsing as IPv6 packet
-                    let Some(ipv6_packet) = Ipv6Packet::new(eth_packet.payload()) else {
-                        continue;
-                    };
-                    // Check the next_header field
-                    if ipv6_packet.get_next_header() != IpNextHeaderProtocols::Icmpv6 {
-                        continue;
-                    }
-                    // Try parsing as advert packet
-                    let Some(na_packet) = NeighborAdvertPacket::new(ipv6_packet.payload()) else {
-                        continue;
-                    };
-                    if na_packet.get_target_addr() == *addr {
-                        return Ok(Some(eth_packet.get_source()));
-                    }
-                }
-                Err(_) => break,
-            };
-        };
+        let icmpv6_packet = Icmpv6Packet::new(ipv6_packet.payload())?;
+        if icmpv6_packet.get_icmpv6_type() != Icmpv6Types::NeighborAdvert {
+            return None;
+        }
+        if icmpv6_packet.get_icmpv6_code() != Icmpv6Codes::NoCode {
+            return None;
+        }
 
-        Ok(None)
+        let na_packet = NeighborAdvertPacket::new(ipv6_packet.payload())?;
+        if ipv6_packet.get_source() != na_packet.get_target_addr() {
+            return None;
+        }
+        if ipv6_packet.get_destination() != source_ip {
+            return None;
+        }
+
+        Some(AddressPair {
+            ip: na_packet.get_target_addr().into(),
+            mac: eth_packet.get_source(),
+        })
     }
 
-    /// Perform ping on IPv4, returns true if got response
-    fn l3_scan_ipv4(&self, tx: &mut Box<dyn DataLinkSender>, rx: &mut Box<dyn DataLinkReceiver>, addr: &Ipv4Addr, mac_addr: MacAddr)
-        -> Result<bool, ScannerError>
-    {
-        const SEQ_NUM: u16 = 1;
-        const IDENTIFIER: u16 = 1;
+    /// Parse ICMPv4 Echo Reply and extract source IPv4 for matching.
+    fn parse_icmpv4_reply(packet: &[u8], source_ip: Ipv4Addr, identifier: u16, sequence_number: u16) -> Option<Ipv4Addr> {
+        // Try constructing Ethernet packet, on fail continue
+        let eth_packet = EthernetPacket::new(packet)?;
+        // Check for correct EtherType field
+        if eth_packet.get_ethertype() != EtherTypes::Ipv4 {
+            return None;
+        }
 
-        let buffer = self.make_icmpv4_echo_request(addr, mac_addr, IDENTIFIER, SEQ_NUM)?;
+        // Try parsing as IPv4 packet, on fail continue
+        let ipv4_packet = Ipv4Packet::new(eth_packet.payload())?;
+        // Check the next_header field
+        if ipv4_packet.get_next_level_protocol() != IpNextHeaderProtocols::Icmp {
+            return None;
+        }
 
-        let send_result = tx.send_to(&buffer, None).ok_or_else(|| ScannerError {
-            code: ScannerExitCode::Os,
-            message: "Failed to queue ICMP frame for sending".to_string(),
-        })?;
+        let icmp_packet = IcmpPacket::new(ipv4_packet.payload())?;
+        // Check if type and code match EchoReply
+        if icmp_packet.get_icmp_type() != IcmpTypes::EchoReply {
+            return None;
+        }
+        if icmp_packet.get_icmp_code() != IcmpCodes::NoCode {
+            return None;
+        }
 
-        if send_result.is_err() {
-            let error_message = format!("Failed to send ICMP frame: {}", send_result.err().unwrap());
-            return Err(ScannerError {
-                code: ScannerExitCode::Os,
-                message: error_message,
-            });
-        };
+        // Try parsing as echo reply packet, on fail continue
+        let echo_reply = EchoReplyPacket::new(ipv4_packet.payload())?;
+        if ipv4_packet.get_destination() != source_ip {
+            return None;
+        }
+        // Check if identifier and sequence number match request
+        if echo_reply.get_identifier() != identifier || echo_reply.get_sequence_number() != sequence_number {
+            return None;
+        }
 
-        let deadline = Instant::now() + self.timeout;
-        // Await response or end on timeout
-        while Instant::now() < deadline {
-            match rx.next() {
-                Ok(frame) => { // Gradually check for valid format and data
-                    // Try constructing Ethernet packet, on fail continue
-                    let Some(eth_packet) = EthernetPacket::new(frame) else {
-                        continue;
-                    };
-                    // Check for correct EtherType field
-                    if eth_packet.get_ethertype() != EtherTypes::Ipv4 {
-                        continue;
-                    };
-
-                    // Try parsing as IPv4 packet, on fail continue
-                    let Some(ipv4_packet) = Ipv4Packet::new(eth_packet.payload()) else {
-                        continue;
-                    };
-                    // Check the next_header field
-                    if ipv4_packet.get_next_level_protocol() != IpNextHeaderProtocols::Icmp {
-                        continue;
-                    };
-                    // Check if source address matches target
-                    if ipv4_packet.get_source() != *addr {
-                        continue;
-                    };
-
-                    // Try parsing as echo reply packet, on fail continue
-                    let Some(echo_reply) = EchoReplyPacket::new(ipv4_packet.payload()) else {
-                        continue;
-                    };
-
-                    if echo_reply.get_icmp_type() != IcmpTypes::EchoReply {
-                        continue;
-                    }
-
-                    // Check if identifier and sequence number match request
-                    if echo_reply.get_identifier() == IDENTIFIER
-                        && echo_reply.get_sequence_number() == SEQ_NUM
-                    {
-                        return Ok(true);
-                    }
-                },
-                Err(_) => break,
-            };
-        };
-
-        Ok(false)
+        Some(ipv4_packet.get_source())
     }
 
-    /// Perform ping on IPv6, returns true if got response
-    fn l3_scan_ipv6(&self, tx: &mut Box<dyn DataLinkSender>, rx: &mut Box<dyn DataLinkReceiver>,
-        addr: &Ipv6Addr, mac_addr: MacAddr) 
-        -> Result<bool, ScannerError>
-    {
-        const SEQ_NUM: u16 = 1;
-        const IDENTIFIER: u16 = 1;
-
-        let buffer = self.make_icmpv6_echo_request(addr, mac_addr, IDENTIFIER, SEQ_NUM)?;
-
-        let send_result = tx.send_to(&buffer, None).ok_or_else(|| ScannerError {
-            code: ScannerExitCode::Os,
-            message: "Failed to queue ICMPv6 frame for sending".to_string(),
-        })?;
-
-        if send_result.is_err() {
-            let error_message = format!("Failed to send ICMPv6 frame: {}", send_result.err().unwrap());
-            return Err(ScannerError {
-                code: ScannerExitCode::Os,
-                message: error_message,
-            });
+    /// Parse ICMPv6 Echo Reply and extract source IPv6 for matching.
+    fn parse_icmpv6_reply(packet: &[u8], source_ip: Ipv6Addr, identifier: u16, sequence_number: u16) -> Option<Ipv6Addr> {
+        // Try constructing Ethernet packet, on fail continue
+        let eth_packet = EthernetPacket::new(packet)?;
+        // Check for correct EtherType field
+        if eth_packet.get_ethertype() != EtherTypes::Ipv6 {
+            return None;
         }
 
-        let deadline = Instant::now() + self.timeout;
-        while Instant::now() < deadline {
-            match rx.next() {
-                Ok(frame) => {
-                    // Construct Ethernet packet, on fail continue
-                    let Some(eth_packet) = EthernetPacket::new(frame) else {
-                        continue;
-                    };
-                    // Check for correct EtherType field
-                    if eth_packet.get_ethertype() != EtherTypes::Ipv6 {
-                        continue;
-                    }
-
-                    // Try parsing as IPv6 packet, on fail continue
-                    let Some(ipv6_packet) = Ipv6Packet::new(eth_packet.payload()) else {
-                        continue;
-                    };
-                    // Check the next_header field
-                    if ipv6_packet.get_next_header() != IpNextHeaderProtocols::Icmpv6 {
-                        continue;
-                    }
-                    // Check if source address matches target
-                    if ipv6_packet.get_source() != *addr {
-                        continue;
-                    }
-
-                    // Try parsing as echo reply packet, on fail continue
-                    let Some(echo_reply) = EchoReplyPacketV6::new(ipv6_packet.payload()) else {
-                        continue;
-                    };
-                    // Should be EchoReply, but for correctness we check
-                    if echo_reply.get_icmpv6_type() != Icmpv6Types::EchoReply {
-                        continue;
-                    }
-                    // Should be again 0
-                    if echo_reply.get_icmpv6_code() != Icmpv6Code(0) {
-                        continue;
-                    }
-
-                    // Check if identifier and sequence number match request
-                    if echo_reply.get_identifier() == IDENTIFIER
-                        && echo_reply.get_sequence_number() == SEQ_NUM
-                    {
-                        return Ok(true);
-                    }
-                }
-                Err(_) => break,
-            };
+        // Try parsing as IPv6 packet, on fail continue
+        let ipv6_packet = Ipv6Packet::new(eth_packet.payload())?;
+        // Check the next_header field
+        if ipv6_packet.get_next_header() != IpNextHeaderProtocols::Icmpv6 {
+            return None;
         }
 
-        Ok(false)
+        let icmpv6_packet = Icmpv6Packet::new(ipv6_packet.payload())?;
+        // Should be EchoReply, but for correctness we check
+        if icmpv6_packet.get_icmpv6_type() != Icmpv6Types::EchoReply {
+            return None;
+        }
+        // Should be again 0
+        if icmpv6_packet.get_icmpv6_code() != Icmpv6Codes::NoCode {
+            return None;
+        }
+
+        // Try parsing as echo reply packet, on fail continue
+        let echo_reply = EchoReplyPacketV6::new(ipv6_packet.payload())?;
+        if ipv6_packet.get_destination() != source_ip {
+            return None;
+        }
+        // Check if identifier and sequence number match request
+        if echo_reply.get_identifier() != identifier || echo_reply.get_sequence_number() != sequence_number {
+            return None;
+        }
+
+        Some(ipv6_packet.get_source())
     }
 
     /// Scan one subnet batch.
     fn scan_network(&self, network: &IpNet, tx: & mut Box<dyn DataLinkSender>, rx: & mut Box<dyn DataLinkReceiver>)
         -> Result<HashMap<IpAddr, ScanMatch>, ScannerError>
     {
+        // Fixed ID and Seq because we do not care much about these and send one request anyway
+        const IDENTIFIER: u16 = 1;
+        const SEQ_NUM: u16 = 1;
+
+        // The final HashMap of non-full-FAIL matchs
         let mut discovered: HashMap<IpAddr, ScanMatch> = HashMap::new();
 
-        let mut last_check_time = Instant::now();
-        // println!("Interface subnets: {:?}", self.interface.ips);
+        // For control signal check
+        let mut last_check = Instant::now();
+
+        // Counter that confirms all packets arrived on 0, worst case we hit timeout
+        let mut pending_l2 = 0usize;
+
+        // Repeated piece of code very specific to this function, not worth to separate for others
+        let mut send_packet = |packet: &[u8], queue_err: &str, send_err_prefix: &str| -> Result<(), ScannerError> {
+            let send_result = tx.send_to(packet, None).ok_or_else(|| ScannerError {
+                code: ScannerExitCode::Os,
+                message: queue_err.to_string(), // Error when attempting to send
+            })?;
+
+            if let Err(err) = send_result {
+                return Err(ScannerError {
+                    code: ScannerExitCode::Os,
+                    message: format!("{}: {}", send_err_prefix, err), // Error after send request performed
+                });
+            }
+
+            Ok(())
+        };
+
+        let iface_ip = match network {
+            IpNet::V4(_) => IpAddr::V4(Self::get_iface_ipv4(&self.interface)?),
+            IpNet::V6(_) => IpAddr::V6(Self::get_iface_ipv6(&self.interface)?),
+        };
+
+        let iface_mac = Self::get_iface_mac(&self.interface)?;
+
         for addr in network.hosts() {
-            // print!("Scanning {}: ", addr);
-            let mut match_result = ScanMatch::default();
-            let is_local = self.interface.ips.iter().any(|net| net.contains(addr));
-            // println!("local: {}", is_local);
-
-            // Scan L2 if in local segment
-            if is_local {
-                // Scan appropriate addres
-                match_result.mac_addr = match addr {
-                    IpAddr::V4(addr) => self.l2_scan_ipv4(tx, rx, &addr)?,
-                    IpAddr::V6(addr) => self.l2_scan_ipv6(tx, rx, &addr)?,
-                };
-
-                // if match_result.mac_addr.is_some() {
-                //     println!("L2 match found: {}", match_result.mac_addr.unwrap());
-                // } else {
-                //     println!("No L2 match");
-                // }
-
-                // Check for shutdown signals
-                if Instant::now() - last_check_time >= CHECK_INTERVAL {
-                    self.check_shutdown()?;
-                    last_check_time = Instant::now();
-                };
+            // Scan L2 only if in local segment
+            if !self.addr_is_local(addr) {
+                continue;
             }
 
-            // Scan L3 if got Mac or not local
-            if is_local && match_result.mac_addr.is_some() || !is_local {
-                let mac_addr = match_result.mac_addr.unwrap_or(MacAddr::broadcast());
-                match_result.icmp_responded = match addr {
-                    IpAddr::V4(addr) => self.l3_scan_ipv4(tx, rx, &addr, mac_addr)?,
-                    IpAddr::V6(addr) => self.l3_scan_ipv6(tx, rx, &addr, mac_addr)?,
-                };
-
-                // At least one layer succeeded, add to results
-                discovered.insert(addr, match_result);
+            if Instant::now() - last_check >= CHECK_INTERVAL {
+                self.check_shutdown()?;
+                last_check = Instant::now();
             }
 
+            match addr {
+                IpAddr::V4(addr) => {
+                    // Scan ARP
+                    let arp_packet = self.make_arp(&addr)?;
+                    send_packet(&arp_packet, "Failed to queue ARP frame for sending", "Failed to send ARP frame")?;
+                }
+                IpAddr::V6(addr) => {
+                    // Scan NDP
+                    let ndp_packet = self.make_ndp(&addr)?;
+                    send_packet(&ndp_packet, "Failed to queue NDP frame for sending", "Failed to send NDP frame")?;
+                }
+            }
+
+            pending_l2 += 1;
+        }
+
+        // Collect L2 replies for one timeout window.
+        let mut pending_l3 = 0usize;
+        let l2_deadline = Instant::now() + self.timeout;
+        while Instant::now() < l2_deadline && pending_l2 > 0 {
+            if Instant::now() - last_check >= CHECK_INTERVAL {
+                self.check_shutdown()?;
+                last_check = Instant::now();
+            }
+
+            match rx.next() {
+                Ok(frame) => {
+                    // Try ARP reply parse first
+                    if let IpAddr::V4(source_ip) = iface_ip {
+                        if let Some(pair) = Self::parse_arp(frame, source_ip, iface_mac) {
+                            discovered.insert(pair.ip, ScanMatch {
+                                mac_addr: Some(pair.mac),
+                                icmp_responded: false
+                            });
+
+                            pending_l2 -= 1;
+                            continue;
+                        }
+                    }
+
+                    // If not ARP, try NDP NA parse
+                    if let IpAddr::V6(source_ip) = iface_ip {
+                        if let Some(pair) = Self::parse_na(frame, source_ip) {
+                            discovered.insert(pair.ip, ScanMatch {
+                                mac_addr: Some(pair.mac),
+                                icmp_responded: false
+                            });
+
+                            pending_l2 -= 1;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.kind() == ErrorKind::TimedOut {
+                        continue;
+                    }
+
+                    return Err(ScannerError {
+                        code: ScannerExitCode::Os,
+                        message: format!("Failed to read L2 packet from datalink: {}", err),
+                    });
+                }
+            }
+        }
+
+        for addr in network.hosts() {
+            if Instant::now() - last_check >= CHECK_INTERVAL {
+                self.check_shutdown()?;
+                last_check = Instant::now();
+            }
+
+            let mac_addr = if self.addr_is_local(addr) {
+                match discovered.get(&addr).and_then(|m| m.mac_addr) {
+                    // No L2 match, cannot do L3 on local target
+                    Some(mac) => mac,
+                    None => continue,
+                }
+            } else {
+                // No MAC known for remote target, set broadcast
+                MacAddr::broadcast()
+            };
+
+            match addr {
+                IpAddr::V4(v4) => {
+                    // Scan ICMPv4
+                    let frame = self.make_icmpv4_echo_request(&v4, mac_addr, IDENTIFIER, SEQ_NUM)?;
+                    send_packet(&frame, "Failed to queue ICMP frame for sending", "Failed to send ICMP frame")?;
+                }
+                IpAddr::V6(v6) => {
+                    // Scan ICMPv6
+                    let frame = self.make_icmpv6_echo_request(&v6, mac_addr, IDENTIFIER, SEQ_NUM)?;
+                    send_packet(&frame, "Failed to queue ICMPv6 frame for sending", "Failed to send ICMPv6 frame")?;
+                }
+            }
+
+            pending_l3 += 1;
+        }
+
+        // Phase 4: collect L3 echo replies for one timeout window.
+        let l3_deadline = Instant::now() + self.timeout;
+        while Instant::now() < l3_deadline && pending_l3 > 0 {
+            if Instant::now() - last_check >= CHECK_INTERVAL {
+                self.check_shutdown()?;
+                last_check = Instant::now();
+            }
+
+            match rx.next() {
+                Ok(frame) => {
+                    // Try ICMPv4 reply parse first
+                    if let IpAddr::V4(source_ip) = iface_ip {
+                        if let Some(ip) = Self::parse_icmpv4_reply(frame, source_ip, IDENTIFIER, SEQ_NUM) {
+                            // Get existing entry or make default all FAIL
+                            let scan_match = discovered.entry(IpAddr::V4(ip)).or_default();
+                            scan_match.icmp_responded = true;
+
+                            pending_l3 -= 1;
+                            continue;
+                        }
+                    }
+
+                    // If not ICMPv4, try ICMPv6 reply parse
+                    if let IpAddr::V6(source_ip) = iface_ip {
+                        if let Some(ip) = Self::parse_icmpv6_reply(frame, source_ip, IDENTIFIER, SEQ_NUM) {
+                            // Get existing entry or make default all FAIL
+                            let scan_match = discovered.entry(IpAddr::V6(ip)).or_default();
+                            scan_match.icmp_responded = true;
+
+                            pending_l3 -= 1;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.kind() == ErrorKind::TimedOut {
+                        continue;
+                    }
+
+                    return Err(ScannerError {
+                        code: ScannerExitCode::Os,
+                        message: format!("Failed to read L3 packet from datalink: {}", err),
+                    });
+                }
+            }
         }
 
         Ok(discovered)
@@ -917,7 +1000,7 @@ fn spawn_listener(control_tx: Sender<ControlMessage>) -> Result<(), ScannerError
             }
         })
         .map_err(|err| ScannerError {
-            code: ScannerExitCode::Internal,
+            code: ScannerExitCode::Os,
             message: format!("Failed to spawn signal listener thread: {err}"),
         })?;
 

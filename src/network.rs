@@ -84,3 +84,52 @@ pub fn spawn_listener(control_tx: Sender<ControlMessage>) -> Result<(), ScannerE
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+    use std::str::FromStr;
+    use std::sync::mpsc;
+
+    use ipnet::IpNet;
+    use pnet::util::MacAddr;
+
+    #[test]
+    fn ns_helpers() {
+        let target = Ipv6Addr::from_str("fd00:cafe::1234:5678").unwrap();
+        assert_eq!(new_ns_addr(&target), Ipv6Addr::from_str("ff02::1:ff34:5678").unwrap());
+        assert_eq!(new_ns_mac(&target), MacAddr::new(0x33, 0x33, 0xff, 0x34, 0x56, 0x78));
+
+        let second = Ipv6Addr::from_str("2001:db8::9abc:def0").unwrap();
+        assert_eq!(new_ns_addr(&second), Ipv6Addr::from_str("ff02::1:ffbc:def0").unwrap());
+        assert_eq!(new_ns_mac(&second), MacAddr::new(0x33, 0x33, 0xff, 0xbc, 0xde, 0xf0));
+
+        let zero_tail = Ipv6Addr::from_str("fd00:cafe::").unwrap();
+        assert_eq!(new_ns_addr(&zero_tail), Ipv6Addr::from_str("ff02::1:ff00:0").unwrap());
+        assert_eq!(new_ns_mac(&zero_tail), MacAddr::new(0x33, 0x33, 0xff, 0x00, 0x00, 0x00));
+    }
+
+    #[test]
+    fn net_size() {
+        assert_eq!(get_net_size(&IpNet::from_str("192.168.1.0/30").unwrap()), 2);
+        assert_eq!(get_net_size(&IpNet::from_str("192.168.1.0/31").unwrap()), 2);
+        assert_eq!(get_net_size(&IpNet::from_str("192.168.1.0/32").unwrap()), 1);
+        assert_eq!(get_net_size(&IpNet::from_str("10.0.0.0/24").unwrap()), 254);
+        assert_eq!(get_net_size(&IpNet::from_str("0.0.0.0/0").unwrap()), 4_294_967_294);
+        assert_eq!(get_net_size(&IpNet::from_str("1.2.3.4/1").unwrap()), 2_147_483_646);
+        assert_eq!(get_net_size(&IpNet::from_str("fd00:cafe::/120").unwrap()), 256);
+        assert_eq!(get_net_size(&IpNet::from_str("fd00:cafe::/128").unwrap()), 1);
+        assert_eq!(get_net_size(&IpNet::from_str("fd00:cafe::/64").unwrap()), 1u128 << 64);
+        assert_eq!(get_net_size(&IpNet::from_str("::/0").unwrap()), u128::MAX);
+        assert_eq!(get_net_size(&IpNet::from_str("2001:db8::/1").unwrap()), 1u128 << 127);
+    }
+
+    #[test]
+    fn listener_init() {
+        let (control_tx, control_rx) = mpsc::channel();
+        spawn_listener(control_tx).unwrap();
+
+        assert!(control_rx.try_recv().is_err());
+    }
+}

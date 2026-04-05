@@ -37,3 +37,46 @@ pub fn format_scan_result(addr: &IpAddr, scan_match: Option<&ScanMatch>) -> Stri
         None => format!("{} {} FAIL, icmpv{} FAIL", addr, proto, icmp),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+
+    use pnet::util::MacAddr;
+
+    use crate::model::ScanMatch;
+
+    #[test]
+    fn mac_format() {
+        assert_eq!(format_mac(MacAddr::new(0, 1, 2, 10, 11, 12)), "(00-01-02-0a-0b-0c)");
+        assert_eq!(format_mac(MacAddr::new(0xff, 0, 0x10, 0xab, 0xcd, 0xef)), "(ff-00-10-ab-cd-ef)");
+    }
+
+    #[test]
+    fn scan_lines() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let scan_match = ScanMatch {
+            mac_addr: Some(MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff)),
+            icmp_responded: true,
+        };
+
+        assert_eq!(
+            format_scan_result(&ipv4, Some(&scan_match)),
+            "192.168.1.10 arp OK (aa-bb-cc-dd-ee-ff), icmpv4 OK"
+        );
+
+        let ipv6 = IpAddr::V6(Ipv6Addr::from_str("fd00:cafe::1").unwrap());
+        assert_eq!(format_scan_result(&ipv6, None), "fd00:cafe::1 ndp FAIL, icmpv6 FAIL");
+
+        let ipv4_missing_mac = ScanMatch {
+            mac_addr: None,
+            icmp_responded: false,
+        };
+        assert_eq!(
+            format_scan_result(&ipv4, Some(&ipv4_missing_mac)),
+            "192.168.1.10 arp FAIL, icmpv4 FAIL"
+        );
+    }
+}

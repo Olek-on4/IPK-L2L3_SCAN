@@ -121,7 +121,7 @@ impl Scanner {
     }
 
     /// Check if address belongs to local segment of the interface.
-    fn addr_is_local(&self, addr: IpAddr) -> bool {
+    pub fn addr_is_local(&self, addr: IpAddr) -> bool {
         self.interface.ips.iter().any(|net| net.contains(addr))
     }
 
@@ -663,7 +663,7 @@ impl Scanner {
     }
 
     /// Scan one subnet batch.
-    fn scan_network(
+    pub fn scan_network(
         &self,
         network: &IpNet,
         tx: &mut Box<dyn DataLinkSender>,
@@ -938,4 +938,352 @@ impl Scanner {
 
         Ok(discovered)
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use pnet::ipnetwork::IpNetwork;
+    use pnet::packet::arp::{ArpOperations, MutableArpPacket};
+    use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
+    use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
+    use pnet::packet::icmp::{self, IcmpPacket, IcmpTypes};
+    use pnet::packet::icmpv6::echo_request::MutableEchoRequestPacket as MutableEchoRequestPacketV6;
+    use pnet::packet::icmpv6::ndp::{MutableNeighborSolicitPacket, NeighborSolicitPacket};
+    use pnet::packet::icmpv6::{Icmpv6Packet, Icmpv6Types};
+    use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
+    use pnet::packet::ipv6::{Ipv6Packet, MutableIpv6Packet};
+    use pnet::util::MacAddr;
+
+    const SOURCE_MAC: MacAddr = MacAddr(0x02, 0x00, 0x00, 0x00, 0x00, 0x01);
+    const SOURCE_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const SOURCE_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xcafe, 0, 0, 0, 0, 0, 1);
+    const TARGET_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 42);
+    const TARGET_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xcafe, 0, 0, 0, 0, 0, 0x42);
+
+
+    fn test_interface() -> NetworkInterface {
+        NetworkInterface {
+            name: "test0".to_string(),
+            description: "test interface".to_string(),
+            index: 1,
+            mac: Some(SOURCE_MAC),
+            ips: vec![
+                IpNetwork::new(IpAddr::V4(SOURCE_V4), 24).unwrap(),
+                IpNetwork::new(IpAddr::V6(SOURCE_V6), 64).unwrap(),
+            ],
+            flags: 0,
+        }
+    }
+
+    fn test_scanner() -> Scanner {
+        let (_control_tx, control_rx) = mpsc::channel();
+
+        Scanner {
+            interface: test_interface(),
+            networks: vec![
+                IpNet::from_str("10.0.0.0/24").unwrap(),
+                IpNet::from_str("fd00:cafe::/120").unwrap(),
+            ],
+            timeout: Duration::from_millis(10),
+            control_rx,
+        }
+    }
+
+    // ===== Packet construction =====
+
+    #[test]
+    fn arp_frame() {
+        let scanner = test_scanner();
+        let frame = scanner.make_arp(&TARGET_V4).unwrap();
+
+        let ethernet = EthernetPacket::new(&frame).unwrap();
+        assert_eq!(ethernet.get_ethertype(), EtherTypes::Arp);
+
+        let arp = pnet::packet::arp::ArpPacket::new(ethernet.payload()).unwrap();
+        assert_eq!(arp.get_operation(), ArpOperations::Request);
+        assert_eq!(arp.get_sender_proto_addr(), SOURCE_V4);
+        assert_eq!(arp.get_target_proto_addr(), TARGET_V4);
+        assert_eq!(arp.get_target_hw_addr(), MacAddr::zero());
+    }
+
+    #[test]
+    fn ndp_frame() {
+        let scanner = test_scanner();
+        let frame = scanner.make_ndp(&TARGET_V6).unwrap();
+
+        let ethernet = EthernetPacket::new(&frame).unwrap();
+        assert_eq!(ethernet.get_ethertype(), EtherTypes::Ipv6);
+        assert_eq!(ethernet.get_destination(), new_ns_mac(&TARGET_V6));
+
+        let ipv6 = Ipv6Packet::new(ethernet.payload()).unwrap();
+        assert_eq!(ipv6.get_next_header(), pnet::packet::ip::IpNextHeaderProtocols::Icmpv6);
+        assert_eq!(ipv6.get_hop_limit(), 255);
+        assert_eq!(ipv6.get_destination(), new_ns_addr(&TARGET_V6));
+
+        let ndp = NeighborSolicitPacket::new(ipv6.payload()).unwrap();
+        assert_eq!(ndp.get_icmpv6_type(), Icmpv6Types::NeighborSolicit);
+        assert_eq!(ndp.get_target_addr(), TARGET_V6);
+    }
+
+    #[test]
+    fn icmp4_frame() {
+        let scanner = test_scanner();
+        let frame = scanner.make_icmpv4_echo(&TARGET_V4, MacAddr::broadcast(), 7, 9).unwrap();
+
+        let ethernet = EthernetPacket::new(&frame).unwrap();
+        let ipv4 = Ipv4Packet::new(ethernet.payload()).unwrap();
+        assert_eq!(ipv4.get_next_level_protocol(), pnet::packet::ip::IpNextHeaderProtocols::Icmp);
+        assert_eq!(ipv4.get_destination(), TARGET_V4);
+
+        let icmp = IcmpPacket::new(ipv4.payload()).unwrap();
+        assert_eq!(icmp.get_icmp_type(), IcmpTypes::EchoRequest);
+        assert_eq!(icmp.get_checksum(), icmp::checksum(&icmp));
+    }
+
+    #[test]
+    fn icmp6_frame() {
+        let scanner = test_scanner();
+        let frame = scanner.make_icmpv6_echo(&TARGET_V6, MacAddr::broadcast(), 7, 9).unwrap();
+
+        let ethernet = EthernetPacket::new(&frame).unwrap();
+        let ipv6 = Ipv6Packet::new(ethernet.payload()).unwrap();
+        assert_eq!(ipv6.get_next_header(), pnet::packet::ip::IpNextHeaderProtocols::Icmpv6);
+        assert_eq!(ipv6.get_destination(), TARGET_V6);
+
+        let icmpv6 = Icmpv6Packet::new(ipv6.payload()).unwrap();
+        assert_eq!(icmpv6.get_icmpv6_type(), Icmpv6Types::EchoRequest);
+    }
+
+    // ===== Packet parsing =====
+
+    #[test]
+    fn arp_parse() {
+        let scanner = test_scanner();
+        let sender_mac = MacAddr::new(0x02, 0x00, 0x00, 0x00, 0x00, 0x02);
+        let sender_ip = TARGET_V4;
+        let mut frame = scanner.make_arp(&sender_ip).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            ethernet.set_source(sender_mac);
+            ethernet.set_destination(SOURCE_MAC);
+
+            let mut arp = MutableArpPacket::new(ethernet.payload_mut()).unwrap();
+            arp.set_operation(ArpOperations::Reply);
+            arp.set_sender_hw_addr(sender_mac);
+            arp.set_sender_proto_addr(sender_ip);
+            arp.set_target_hw_addr(SOURCE_MAC);
+            arp.set_target_proto_addr(SOURCE_V4);
+        }
+
+        let parsed = Scanner::parse_arp(&frame, SOURCE_V4, SOURCE_MAC).unwrap();
+        assert_eq!(parsed.ip, IpAddr::V4(sender_ip));
+        assert_eq!(parsed.mac, sender_mac);
+    }
+
+    #[test]
+    fn arp_reject() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_arp(&TARGET_V4).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut arp = MutableArpPacket::new(ethernet.payload_mut()).unwrap();
+            arp.set_operation(ArpOperations::Reply);
+            arp.set_target_proto_addr(Ipv4Addr::new(10, 0, 0, 99));
+        }
+
+        assert!(Scanner::parse_arp(&frame, SOURCE_V4, SOURCE_MAC).is_none());
+    }
+
+    #[test]
+    fn arp_reject_ethertype() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_arp(&TARGET_V4).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            ethernet.set_ethertype(EtherTypes::Ipv6);
+        }
+
+        assert!(Scanner::parse_arp(&frame, SOURCE_V4, SOURCE_MAC).is_none());
+    }
+
+    #[test]
+    fn ndp_parse() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_ndp(&TARGET_V6).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            ethernet.set_source(SOURCE_MAC);
+            ethernet.set_destination(SOURCE_MAC);
+
+            let mut ipv6 = MutableIpv6Packet::new(ethernet.payload_mut()).unwrap();
+            ipv6.set_source(TARGET_V6);
+            ipv6.set_destination(SOURCE_V6);
+
+            let mut ndp = MutableNeighborSolicitPacket::new(ipv6.payload_mut()).unwrap();
+            ndp.set_icmpv6_type(Icmpv6Types::NeighborAdvert);
+            ndp.set_target_addr(TARGET_V6);
+            ndp.set_checksum(pnet::packet::icmpv6::checksum(
+                &Icmpv6Packet::new(ndp.packet()).unwrap(),
+                &TARGET_V6,
+                &SOURCE_V6,
+            ));
+        }
+
+        let parsed = Scanner::parse_na(&frame, SOURCE_V6).unwrap();
+        assert_eq!(parsed.ip, IpAddr::V6(TARGET_V6));
+        assert_eq!(parsed.mac, SOURCE_MAC);
+    }
+
+    #[test]
+    fn ndp_reject() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_ndp(&TARGET_V6).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv6 = MutableIpv6Packet::new(ethernet.payload_mut()).unwrap();
+            let mut ndp = MutableNeighborSolicitPacket::new(ipv6.payload_mut()).unwrap();
+            ndp.set_icmpv6_type(Icmpv6Types::NeighborSolicit);
+        }
+
+        assert!(Scanner::parse_na(&frame, SOURCE_V6).is_none());
+    }
+
+    #[test]
+    fn ndp_reject_destination() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_ndp(&TARGET_V6).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv6 = MutableIpv6Packet::new(ethernet.payload_mut()).unwrap();
+            ipv6.set_destination(Ipv6Addr::new(0xfd00, 0xcafe, 0, 0, 0, 0, 0, 0x43));
+            let mut ndp = MutableNeighborSolicitPacket::new(ipv6.payload_mut()).unwrap();
+            ndp.set_icmpv6_type(Icmpv6Types::NeighborAdvert);
+        }
+
+        assert!(Scanner::parse_na(&frame, SOURCE_V6).is_none());
+    }
+
+    #[test]
+    fn icmp4_parse() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_icmpv4_echo(&TARGET_V4, MacAddr::broadcast(), 7, 9).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv4 = MutableIpv4Packet::new(ethernet.payload_mut()).unwrap();
+            ipv4.set_source(TARGET_V4);
+            ipv4.set_destination(SOURCE_V4);
+            let mut icmp = MutableEchoRequestPacket::new(ipv4.payload_mut()).unwrap();
+            icmp.set_icmp_type(IcmpTypes::EchoReply);
+            icmp.set_checksum(icmp::checksum(&IcmpPacket::new(icmp.packet()).unwrap()));
+        }
+
+        assert_eq!(Scanner::parse_icmpv4_reply(&frame, SOURCE_V4, 7, 9), Some(TARGET_V4));
+    }
+
+    #[test]
+    fn icmp4_reject() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_icmpv4_echo(&TARGET_V4, MacAddr::broadcast(), 7, 9).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv4 = MutableIpv4Packet::new(ethernet.payload_mut()).unwrap();
+            let mut icmp = MutableEchoRequestPacket::new(ipv4.payload_mut()).unwrap();
+            icmp.set_icmp_type(IcmpTypes::EchoReply);
+            icmp.set_identifier(99);
+            icmp.set_checksum(icmp::checksum(&IcmpPacket::new(icmp.packet()).unwrap()));
+        }
+
+        assert!(Scanner::parse_icmpv4_reply(&frame, SOURCE_V4, 7, 9).is_none());
+    }
+
+    #[test]
+    fn icmp4_reject_proto() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_icmpv4_echo(&TARGET_V4, MacAddr::broadcast(), 7, 9).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv4 = MutableIpv4Packet::new(ethernet.payload_mut()).unwrap();
+            ipv4.set_next_level_protocol(pnet::packet::ip::IpNextHeaderProtocols::Udp);
+            let mut icmp = MutableEchoRequestPacket::new(ipv4.payload_mut()).unwrap();
+            icmp.set_icmp_type(IcmpTypes::EchoReply);
+        }
+
+        assert!(Scanner::parse_icmpv4_reply(&frame, SOURCE_V4, 7, 9).is_none());
+    }
+
+    #[test]
+    fn icmp6_parse() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_icmpv6_echo(&TARGET_V6, MacAddr::broadcast(), 7, 9).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv6 = MutableIpv6Packet::new(ethernet.payload_mut()).unwrap();
+            ipv6.set_source(TARGET_V6);
+            ipv6.set_destination(SOURCE_V6);
+            let mut icmpv6 = MutableEchoRequestPacketV6::new(ipv6.payload_mut()).unwrap();
+            icmpv6.set_icmpv6_type(Icmpv6Types::EchoReply);
+            icmpv6.set_checksum(pnet::packet::icmpv6::checksum(
+                &Icmpv6Packet::new(icmpv6.packet()).unwrap(),
+                &TARGET_V6,
+                &SOURCE_V6,
+            ));
+        }
+
+        assert_eq!(Scanner::parse_icmpv6_reply(&frame, SOURCE_V6, 7, 9), Some(TARGET_V6));
+    }
+
+    #[test]
+    fn icmp6_reject() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_icmpv6_echo(&TARGET_V6, MacAddr::broadcast(), 7, 9).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv6 = MutableIpv6Packet::new(ethernet.payload_mut()).unwrap();
+            let mut icmpv6 = MutableEchoRequestPacketV6::new(ipv6.payload_mut()).unwrap();
+            icmpv6.set_icmpv6_type(Icmpv6Types::EchoReply);
+            icmpv6.set_sequence_number(123);
+            icmpv6.set_checksum(pnet::packet::icmpv6::checksum(
+                &Icmpv6Packet::new(icmpv6.packet()).unwrap(),
+                &TARGET_V6,
+                &SOURCE_V6,
+            ));
+        }
+
+        assert!(Scanner::parse_icmpv6_reply(&frame, SOURCE_V6, 7, 9).is_none());
+    }
+
+    #[test]
+    fn icmp6_reject_proto() {
+        let scanner = test_scanner();
+        let mut frame = scanner.make_icmpv6_echo(&TARGET_V6, MacAddr::broadcast(), 7, 9).unwrap();
+
+        {
+            let mut ethernet = MutableEthernetPacket::new(&mut frame).unwrap();
+            let mut ipv6 = MutableIpv6Packet::new(ethernet.payload_mut()).unwrap();
+            ipv6.set_next_header(pnet::packet::ip::IpNextHeaderProtocols::Udp);
+            let mut icmpv6 = MutableEchoRequestPacketV6::new(ipv6.payload_mut()).unwrap();
+            icmpv6.set_icmpv6_type(Icmpv6Types::EchoReply);
+        }
+
+        assert!(Scanner::parse_icmpv6_reply(&frame, SOURCE_V6, 7, 9).is_none());
+    }
+
 }

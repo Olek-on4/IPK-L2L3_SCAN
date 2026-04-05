@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Olek"]
 
+[lib]
+name = "ipk_l2l3_scan"
+
+[[bin]]
+name = "ipk-L2L3-scan"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 ipnet = "2.12.0"

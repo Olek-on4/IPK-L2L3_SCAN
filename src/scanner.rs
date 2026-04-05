@@ -24,10 +24,8 @@ use pnet::packet::{MutablePacket, Packet};
 use pnet::util::MacAddr;
 
 use crate::cli::Cli;
-use crate::model::{
-    AddressPair, ControlMessage, ScanMatch, ScannerError, ScannerExitCode,
-};
-use crate::network::{new_ns_addr, new_ns_mac, get_net_size};
+use crate::model::{AddressPair, ControlMessage, ScanMatch, ScannerError, ScannerExitCode};
+use crate::network::{get_net_size, new_ns_addr, new_ns_mac};
 
 const CHECK_INTERVAL: Duration = Duration::from_millis(20);
 

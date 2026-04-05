@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 
             match scanner.run() {
                 Ok(matches) => {
-					// If ran successfuly, print results in the required format
+                    // If ran successfuly, print results in the required format
                     for addr in scanner.networks().iter().flat_map(|net| net.hosts()) {
                         println!("{}", format_scan_result(&addr, matches.get(&addr)));
                     }

@@ -1,6 +1,6 @@
 //! Formatting functions for more meaningful errors and correct format.
-use std::net::IpAddr;
 use pnet::util::MacAddr;
+use std::net::IpAddr;
 
 use crate::model::{ScanMatch, ScannerExitCode};
 

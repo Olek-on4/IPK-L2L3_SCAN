@@ -1,11 +1,10 @@
 //! Basic control, result and error handling implementation.
-use std::net::{IpAddr};
+use std::net::IpAddr;
 use std::process::ExitCode;
 
 use pnet::util::MacAddr;
 
 use crate::format::format_exit;
-
 
 /// Exit codes for the Scanner, following linux sysexits.
 #[repr(u8)]

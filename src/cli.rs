@@ -5,6 +5,7 @@ use ipnet::IpNet;
 #[derive(Debug, clap::Parser)]
 #[command(name = "l2l3-scanner")]
 #[command(about = "Scans for available IpV4 and IpV6 addresses on provided interface", long_about = None)]
+#[command(help_template = "{about}\n\nSynopsis:\n  ./ipk-L2L3-scan -i INTERFACE [-s SUBNET]... [-w TIMEOUT] [-h | --help]\n\n{all-args}\n{after-help}")]
 pub struct Cli {
     /// Available network interface to scan (e.g. 'wlan0'), or list interfaces if not provided.
     #[arg(short, value_name = "INTERFACE", num_args = 0..=1)]

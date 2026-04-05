@@ -23,6 +23,7 @@ test-down:
 
 test:
 	bash test/test.sh run
+	cargo test --all-targets
 
 check:
 	cargo check --all-targets
@@ -35,7 +36,7 @@ clippy:
 
 zip:
 	@echo TODO: Add NESFIT to gitea repo
-	zip -r xhumeno00.zip *.md LICENCE Makefile src test
+	zip -r xhumeno00.zip Cargo.toml Cargo.lock *.md LICENSE Makefile src test
 
 clean:
 	cargo clean

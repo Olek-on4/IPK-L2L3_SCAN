@@ -26,7 +26,7 @@ use pnet::packet::icmpv6::{
     ndp::{MutableNeighborSolicitPacket, NeighborAdvertPacket, NdpOption, NdpOptionTypes},
     Icmpv6Packet, Icmpv6Types
 };
-use pnet::packet::ip::{IpNextHeaderProtocols};
+use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv6::{Ipv6Packet, MutableIpv6Packet};
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::{
@@ -111,7 +111,7 @@ struct Cli {
     subnets: Option<Vec<IpNet>>,
 
     /// Program timeout value in milliseconds
-    #[arg(short, default_value_t = 1000)]
+    #[arg(short = 'w', default_value_t = 1000)]
     timeout: u64,
 }
 
@@ -316,10 +316,90 @@ impl Scanner {
         Ok(buffer)
     }
 
+    /// Construct Ethernet with IPv6 headers and return buffer.
+    fn make_ipv6(
+        &self,
+        dest_mac: MacAddr,
+        source_ip: Ipv6Addr,
+        dest_ip: Ipv6Addr,
+        next_header: IpNextHeaderProtocol,
+        hop_limit: u8,
+        payload_len: usize,
+    ) -> Result<Vec<u8>, ScannerError> {
+        let mut buffer = Self::make_ethernet(
+            &self.interface,
+            dest_mac,
+            EtherTypes::Ipv6,
+            MutableIpv6Packet::minimum_packet_size() + payload_len,
+        )?;
+
+        let mut eth_packet = MutableEthernetPacket::new(&mut buffer).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to create Ethernet frame for IPv6 payload".to_string(),
+        })?;
+
+        let mut ipv6_packet = MutableIpv6Packet::new(eth_packet.payload_mut()).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to create IPv6 packet".to_string(),
+        })?;
+
+        ipv6_packet.set_version(6);
+        ipv6_packet.set_source(source_ip);
+        ipv6_packet.set_destination(dest_ip);
+        ipv6_packet.set_next_header(next_header);
+        ipv6_packet.set_hop_limit(hop_limit);
+        ipv6_packet.set_payload_length(payload_len as u16);
+
+        Ok(buffer)
+    }
+
+    /// Construct Ethernet with IPv4 headers and return buffer.
+    fn make_ipv4(
+        &self,
+        dest_mac: MacAddr,
+        source_ip: Ipv4Addr,
+        dest_ip: Ipv4Addr,
+        next_header: IpNextHeaderProtocol,
+        ttl: u8,
+        payload_len: usize,
+    ) -> Result<Vec<u8>, ScannerError> {
+        let mut buffer = Self::make_ethernet(
+            &self.interface,
+            dest_mac,
+            EtherTypes::Ipv4,
+            MutableIpv4Packet::minimum_packet_size() + payload_len,
+        )?;
+
+        let mut eth_packet = MutableEthernetPacket::new(&mut buffer).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to create Ethernet frame for IPv4 payload".to_string(),
+        })?;
+
+        let mut ipv4_packet = MutableIpv4Packet::new(eth_packet.payload_mut()).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to create IPv4 packet".to_string(),
+        })?;
+
+        ipv4_packet.set_version(4);
+        ipv4_packet.set_header_length(5);
+        ipv4_packet.set_total_length((MutableIpv4Packet::minimum_packet_size() + payload_len) as u16);
+        ipv4_packet.set_ttl(ttl);
+        ipv4_packet.set_next_level_protocol(next_header);
+        ipv4_packet.set_source(source_ip);
+        ipv4_packet.set_destination(dest_ip);
+
+        let ipv4_packet_imm = Ipv4Packet::new(ipv4_packet.packet()).ok_or_else(|| ScannerError {
+            code: ScannerExitCode::Internal,
+            message: "Failed to view IPv4 packet for checksum calculation".to_string(),
+        })?;
+        let ipv4_checksum = pnet::packet::ipv4::checksum(&ipv4_packet_imm);
+        ipv4_packet.set_checksum(ipv4_checksum);
+
+        Ok(buffer)
+    }
+
     /// Construct an ARP request packet for the given target IPv4 address.
     fn make_arp(&self, target_ip: &Ipv4Addr) -> Result<Vec<u8>, ScannerError> {
-        // Unknown destination MAC, so broadcast is the correct L2 target.
-        // ARP carries an IPv4 resolution request.
         // ARP Ethernet/IPv4 payload size is fixed at 28 bytes.
         let mut buffer = Self::make_ethernet(
             &self.interface,
@@ -337,25 +417,22 @@ impl Scanner {
 
         let source_ip = Self::get_iface_ipv4(&self.interface)?;
 
-        // Ethernet is the only hardware type relevant on this link.
+        // Ethernet is the only hardware type relevant
         arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
-        // IPv4 is the protocol being resolved by ARP.
         arp_packet.set_protocol_type(EtherTypes::Ipv4);
-        // Request opcode is mandatory for address discovery.
+        // Request opcode required
         arp_packet.set_operation(ArpOperations::Request);
 
-        // Ethernet MAC addresses are 6 bytes.
+        // Ethernet MAC addresses are 6 bytes
         arp_packet.set_hw_addr_len(6);
-        // IPv4 addresses are 4 bytes.
+        // IPv4 addresses are 4 bytes
         arp_packet.set_proto_addr_len(4);
 
-        // Sender MAC must be the interface MAC so replies can be routed back.
         arp_packet.set_sender_hw_addr(Self::get_iface_mac(&self.interface)?);
-        // Sender IPv4 must be the interface IPv4 on the local subnet.
         arp_packet.set_sender_proto_addr(source_ip);
-        // Target MAC is unknown in an ARP request, zero is the standard placeholder.
+
+        // Target MAC is unknown in an ARP request, set to zero
         arp_packet.set_target_hw_addr(MacAddr::zero());
-        // Target IPv4 is the host we want to resolve.
         arp_packet.set_target_proto_addr(*target_ip);
 
         Ok(buffer)
@@ -365,21 +442,22 @@ impl Scanner {
     fn make_ndp(&self, target_ip: &Ipv6Addr) -> Result<Vec<u8>, ScannerError> {
         let ndp_len = MutableNeighborSolicitPacket::minimum_packet_size() + 8; // 8 for Source MAC option
 
-        // Solicited-node multicast MAC keeps the request on the target neighborhood.
-        // IPv6 EtherType marks the payload as IPv6.
-        // NDP payload is the IPv6 header plus the Neighbor Solicitation body.
-        let mut buffer = Self::make_ethernet(
-            &self.interface,
-            Self::new_ns_mac(target_ip),
-            EtherTypes::Ipv6,
-            MutableIpv6Packet::minimum_packet_size() + ndp_len
-        )?;
-
         let source_ip = Self::get_iface_ipv6(&self.interface)?;
         // Source MAC option is required
         let source_mac = Self::get_iface_mac(&self.interface)?;
         // Destination IPv6 is the solicited-node multicast address
         let dest_ip = Self::new_ns_addr(target_ip);
+
+        // Solicited-node multicast MAC keeps the request on the target neighborhood
+        // Hop limit 255 is required by RFC 4861
+        let mut buffer = self.make_ipv6(
+            Self::new_ns_mac(target_ip),
+            source_ip,
+            dest_ip,
+            IpNextHeaderProtocols::Icmpv6,
+            255,
+            ndp_len,
+        )?;
 
         let mut eth_packet = MutableEthernetPacket::new(&mut buffer).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
@@ -390,18 +468,6 @@ impl Scanner {
             code: ScannerExitCode::Internal,
             message: "Failed to create IPv6 packet".to_string(),
         })?;
-
-        // IPv6 version is 6
-        ipv6_packet.set_version(6);
-        // Neighbor Discovery is carried over ICMPv6
-        ipv6_packet.set_next_header(IpNextHeaderProtocols::Icmpv6);
-        // Hop limit 255 is required by RFC 4861
-        ipv6_packet.set_hop_limit(255);
-        // Payload length covers only the NDP body
-        ipv6_packet.set_payload_length(ndp_len as u16);
-
-        ipv6_packet.set_source(source_ip);
-        ipv6_packet.set_destination(dest_ip);
 
         let mut ndp_packet = MutableNeighborSolicitPacket::new(ipv6_packet.payload_mut()).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
@@ -439,21 +505,22 @@ impl Scanner {
     }
 
     /// Construct an IPv4 ICMP echo request packet for the given target address.
-    fn make_icmpv4_echo_request(&self, target_ip: &Ipv4Addr, mac_addr: MacAddr,
+    fn make_icmpv4_echo(&self, target_ip: &Ipv4Addr, mac_addr: MacAddr,
         identifier: u16, sequence_number: u16)
         -> Result<Vec<u8>, ScannerError>
     {
         // Allocate space for IPv4 header + ICMP echo request packet
         let echo_len = MutableEchoRequestPacket::minimum_packet_size();
-
-        let mut buffer = Self::make_ethernet(
-            &self.interface,
-            mac_addr,
-            EtherTypes::Ipv4,
-            MutableIpv4Packet::minimum_packet_size() + echo_len,
-        )?;
-
         let source_ip = Self::get_iface_ipv4(&self.interface)?;
+
+        let mut buffer = self.make_ipv4(
+            mac_addr,
+            source_ip,
+            *target_ip,
+            IpNextHeaderProtocols::Icmp,
+            64, // Standard
+            echo_len,
+        )?;
 
         let mut ipv4_packet = MutableIpv4Packet::new(
             &mut buffer[MutableEthernetPacket::minimum_packet_size()..]
@@ -462,33 +529,15 @@ impl Scanner {
             message: "Failed to create IPv4 packet for ICMP".to_string(),
         })?;
 
-        // For IPv4
-        ipv4_packet.set_version(4);
-        // 5 fields of 4 bytes
-        ipv4_packet.set_header_length(5);
-        ipv4_packet.set_total_length((MutableIpv4Packet::minimum_packet_size() + echo_len) as u16);
-        ipv4_packet.set_ttl(64);
-        ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Icmp);
-        ipv4_packet.set_source(source_ip);
-        ipv4_packet.set_destination(*target_ip);
-
-        // IPv4 header checksum must be calculated
-        let ipv4_packet_imm = Ipv4Packet::new(ipv4_packet.packet()).ok_or_else(|| ScannerError {
-            code: ScannerExitCode::Internal,
-            message: "Failed to view IPv4 packet for checksum calculation".to_string(),
-        })?;
-        let ipv4_checksum = pnet::packet::ipv4::checksum(&ipv4_packet_imm);
-        ipv4_packet.set_checksum(ipv4_checksum);
-
         let mut icmp_packet = MutableEchoRequestPacket::new(ipv4_packet.payload_mut()).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
             message: "Failed to create ICMPv4 echo request packet".to_string(),
         })?;
 
         icmp_packet.set_icmp_type(IcmpTypes::EchoRequest);
+        // Do not really care but srt something
         icmp_packet.set_sequence_number(sequence_number);
         icmp_packet.set_identifier(identifier);
-
 
         let icmp_packet_imm = IcmpPacket::new(icmp_packet.packet()).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
@@ -501,20 +550,21 @@ impl Scanner {
     }
 
     /// Construct an IPv6 ICMP echo request packet for the given target address.
-    fn make_icmpv6_echo_request(&self, target_ip: &Ipv6Addr, mac_addr: MacAddr,
+    fn make_icmpv6_echo(&self, target_ip: &Ipv6Addr, mac_addr: MacAddr,
         identifier: u16, sequence_number: u16)
         -> Result<Vec<u8>, ScannerError>
     {
         let echo_len = MutableEchoRequestPacketV6::minimum_packet_size();
-
-        let mut buffer = Self::make_ethernet(
-            &self.interface,
-            mac_addr,
-            EtherTypes::Ipv6,
-            MutableIpv6Packet::minimum_packet_size() + echo_len,
-        )?;
-
         let source_ip = Self::get_iface_ipv6(&self.interface)?;
+
+        let mut buffer = self.make_ipv6(
+            mac_addr,
+            source_ip,
+            *target_ip,
+            IpNextHeaderProtocols::Icmpv6,
+            64, // Standard
+            echo_len,
+        )?;
 
         let mut eth_packet = MutableEthernetPacket::new(&mut buffer).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
@@ -525,14 +575,6 @@ impl Scanner {
             code: ScannerExitCode::Internal,
             message: "Failed to create IPv6 packet for ICMPv6".to_string(),
         })?;
-
-        ipv6_packet.set_version(6);
-        ipv6_packet.set_source(source_ip);
-        ipv6_packet.set_destination(*target_ip);
-        ipv6_packet.set_next_header(IpNextHeaderProtocols::Icmpv6);
-        // Frequent hop limit 
-        ipv6_packet.set_hop_limit(64);
-        ipv6_packet.set_payload_length(echo_len as u16);
 
         let mut icmpv6_packet = MutableEchoRequestPacketV6::new(ipv6_packet.payload_mut()).ok_or_else(|| ScannerError {
             code: ScannerExitCode::Internal,
@@ -579,7 +621,7 @@ impl Scanner {
         if arp_packet.get_operation() != ArpOperations::Reply {
             return None;
         }
-        // Reply must be addressed to us and must advertise its own IPv4.
+        // Addresses must match
         if arp_packet.get_target_proto_addr() != source_ip {
             return None;
         }
@@ -618,6 +660,7 @@ impl Scanner {
         }
 
         let na_packet = NeighborAdvertPacket::new(ipv6_packet.payload())?;
+        // Address must match
         if ipv6_packet.get_source() != na_packet.get_target_addr() {
             return None;
         }
@@ -776,7 +819,7 @@ impl Scanner {
             pending_l2 += 1;
         }
 
-        // Collect L2 replies for one timeout window.
+        // Collect replies with timeout
         let mut pending_l3 = 0usize;
         let l2_deadline = Instant::now() + self.timeout;
         while Instant::now() < l2_deadline && pending_l2 > 0 {
@@ -825,6 +868,7 @@ impl Scanner {
             }
         }
 
+        // Send L3 requests
         for addr in network.hosts() {
             if Instant::now() - last_check >= CHECK_INTERVAL {
                 self.check_shutdown()?;
@@ -845,12 +889,12 @@ impl Scanner {
             match addr {
                 IpAddr::V4(v4) => {
                     // Scan ICMPv4
-                    let frame = self.make_icmpv4_echo_request(&v4, mac_addr, IDENTIFIER, SEQ_NUM)?;
+                    let frame = self.make_icmpv4_echo(&v4, mac_addr, IDENTIFIER, SEQ_NUM)?;
                     send_packet(&frame, "Failed to queue ICMP frame for sending", "Failed to send ICMP frame")?;
                 }
                 IpAddr::V6(v6) => {
                     // Scan ICMPv6
-                    let frame = self.make_icmpv6_echo_request(&v6, mac_addr, IDENTIFIER, SEQ_NUM)?;
+                    let frame = self.make_icmpv6_echo(&v6, mac_addr, IDENTIFIER, SEQ_NUM)?;
                     send_packet(&frame, "Failed to queue ICMPv6 frame for sending", "Failed to send ICMPv6 frame")?;
                 }
             }
@@ -858,7 +902,7 @@ impl Scanner {
             pending_l3 += 1;
         }
 
-        // Phase 4: collect L3 echo replies for one timeout window.
+        // Collect replies
         let l3_deadline = Instant::now() + self.timeout;
         while Instant::now() < l3_deadline && pending_l3 > 0 {
             if Instant::now() - last_check >= CHECK_INTERVAL {

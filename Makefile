@@ -1,5 +1,5 @@
-BIN := L2L3-scan
-RELEASE_BIN := src/target/release/$(BIN)
+BIN := ipk-L2L3-scan
+RELEASE_BIN := target/release/$(BIN)
 
 all: build
 
@@ -8,12 +8,18 @@ NixDevShellName:
 	@echo rust
 
 build:
-	cargo build --release
+	cargo build --release --bin $(BIN)
 	cp $(RELEASE_BIN) ./$(BIN)
 	chmod +x ./$(BIN)
 
 run:
 	cargo run --release --bin $(BIN) --
+
+test-up:
+	bash test/test.sh setup
+
+test-down:
+	bash test/test.sh cleanup
 
 test:
 	bash test/test.sh run

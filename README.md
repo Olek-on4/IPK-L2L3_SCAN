@@ -74,6 +74,7 @@ By standard, program output goes to `stdout` and errors to `stderr`.
 - The scanner is implemented in Rust as a single binary, since I wanted to learn Rust and this project seemed like a good fit.
 - Packet construction is done manually with `pnet` so the program can send and parse the exact Ethernet/IP/ICMP/ARP/NDP frames/packets required.
 - Discovery is synchronous and deadline-based. The code sends requests, waits for timeout per read or whole subnet scan, and then collects layer results.
+- Routed targets use Linux procfs route tables from `src/route.rs` to pick the next hop.
 - A dedicated signal-listener thread forwards termination requests into the scan loop without blocking.
 - The code is split across modules `cli.rs`, `format.rs`, `model.rs`, `network.rs`, `scanner.rs` to be utilized from `lib.rs` by `main.rs` for simple structure and organization.
 
@@ -90,6 +91,13 @@ By standard, program output goes to `stdout` and errors to `stderr`.
 - `ip` and network namespace setup for tests.
 - Network configuraion: one host namespace, one local/router namespace, and one remote namespace connected with `veth` pairs.
 - Utils used: `bash`, `iproute2`, `cargo`, `rustc`, `rustfmt`, `clippy`.
+
+### Validation
+
+- Every module has reasonable tests in Rust's native framework.
+- The shell harness covers CLI, setup, local scan, and routed scan paths.
+
+Validation results: 10/15 points, the local-link routing was not implemented yet.
 
 ### How To Run
 
@@ -109,7 +117,7 @@ The script in `test/test.sh` does this:
 
 After that, `cargo test --all-targets` runs the Rust unit tests in `src/`.
 
-### Inputs, Expected Output, and Results
+### Test I/O and Results
 
 | Check | Input | Expected | Outcome |
 | --- | --- | --- | --- |
@@ -127,6 +135,7 @@ After that, `cargo test --all-targets` runs the Rust unit tests in `src/`.
 - The scanner is Linux-focused because it depends on raw datalink access and network namespaces.
 - Running the tests requires elevated privileges.
 - The test suite validates behavior against a controlled local `veth` setup; it does not replace manual verification on real network hardware.
+- Route lookup depends on Linux procfs route tables, so the routing part is Linux-only too.
 
 ## References
 
@@ -136,3 +145,5 @@ After that, `cargo test --all-targets` runs the Rust unit tests in `src/`.
 - [pnet crate documentation](https://docs.rs/pnet/)
 - [signal-hook crate documentation](https://docs.rs/signal-hook/)
 - [Rust standard library](https://doc.rust-lang.org/std/)
+
+MIT Licenced. AI was used for testing, Rust syntax, research, documentation and file splitting.

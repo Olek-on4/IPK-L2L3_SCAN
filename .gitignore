@@ -1,12 +1,9 @@
+# Build
 ipk-L2L3-scan
+
+# Project export
+xhumeno00.zip
 
 # Added by cargo
 
 /target
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target

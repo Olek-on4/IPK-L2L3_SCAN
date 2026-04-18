@@ -193,3 +193,60 @@ impl RouteV6Entry {
         Ok(Ipv6Addr::from(bytes))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+
+    #[test]
+    fn parse_v4_route_row() {
+        let entry = RouteV4Entry::parse("eth0 0100A8C0 0200A8C0 0001 0 0 0 00FFFFFF").unwrap();
+
+        assert_eq!(entry.interface_name, "eth0");
+        assert_eq!(entry.destination, 0x0100A8C0);
+        assert_eq!(entry.mask, 0x00FFFFFF);
+        assert_eq!(entry.gateway, Ipv4Addr::from(u32::from_le(0x0200A8C0)));
+    }
+
+    #[test]
+    fn parse_v6_route_row() {
+        let entry = RouteV6Entry::parse(
+            "20010DB8000000000000000000000042 40 0000000000000000 00000000 20010DB8000000000000000000000001 00000000 00000000 00000000 00000000 eth0",
+        )
+        .unwrap();
+
+        assert_eq!(entry.interface_name, "eth0");
+        assert_eq!(entry.destination, Ipv6Addr::from_str("2001:db8::42").unwrap());
+        assert_eq!(entry.prefix_len, 0x40);
+        assert_eq!(entry.next_hop, Ipv6Addr::from_str("2001:db8::1").unwrap());
+    }
+
+    #[test]
+    fn ipv6_prefix_match_full_byte() {
+        let mut target = [0u8; 16];
+        let prefix = Ipv6Addr::from_str("::").unwrap();
+        target[8] = 0x80;
+
+        assert!(RouteTable::prefix_matches(&target, &prefix, 64));
+        assert!(!RouteTable::prefix_matches(&target, &prefix, 65));
+    }
+
+    #[test]
+    fn ipv6_prefix_match_partial_byte() {
+        let target = Ipv6Addr::from_str("2001:db8:8000::1").unwrap().octets();
+        let prefix = Ipv6Addr::from_str("2001:db8:8000::").unwrap();
+        let other = Ipv6Addr::from_str("2001:db8:9000::").unwrap();
+
+        assert!(RouteTable::prefix_matches(&target, &prefix, 49));
+        assert!(!RouteTable::prefix_matches(&target, &other, 49));
+    }
+
+    #[test]
+    fn parse_v6_route_row_rejects_short_hex() {
+        let err = RouteV6Entry::hex_ipv6("deadbeef").unwrap_err();
+
+        assert_eq!(err.code, ScannerExitCode::Os);
+    }
+}
